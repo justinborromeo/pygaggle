@@ -11,60 +11,8 @@ import argparse
 import json
 from pathlib import Path
 from os import path
-
-parser = argparse.ArgumentParser()
-parser.add_argument("--queries", type=str, required=True,
-                    help="tsv file with two columns, <query_id> and <query_text>")
-parser.add_argument("--run", type=str, required=True,
-                    help="tsv file with three columns <query_id>, <doc_id> and <rank>")
-parser.add_argument('--corpus', required=True, type=str,
-                    help='The path to the directory containing \
-                          the document JSON files')
-parser.add_argument("--t5_input", type=str, required=True,
-                    help="path to store t5_input, txt format")
-parser.add_argument("--t5_input_ids", type=str, required=True,
-                    help="path to store the query-doc ids of t5_input, tsv format")
-parser.add_argument('--use-question-and-query', action='store_true',
-                    help="If true, the t5 input query is a concatenation of \
-                        question and query.  Otherwise, it's just the question.")
-args = parser.parse_args()
-
-def get_document_text(path_to_toplevel_docs_directory, filename):
-    """
-    Returns a string containing document text prepended with the title.
-    """
-    if path.exists(path_to_toplevel_docs_directory + "/" + filename +".json"):
-        filepath = path_to_toplevel_docs_directory + "/" + filename +".json"
-    else:
-    # The final-round consumer primary corpus has nested subdirectories
-    # breaking up documents by search.  Also, some of the consumer documents 
-    # are suffixed with an additional GUID.  Therefore, we need to do a global
-    # search for the file if the initial search doesn't work.
-        filepaths = list(Path(path_to_toplevel_docs_directory).rglob(filename+"*"))
-        if len(filepaths) == 0:
-            print("Unable to find document named " + filename)
-            return ""
-        elif len(filepaths) > 1:
-            print("Multiple paths found for document named " + filename)
-
-        filepath = filepaths[0]
-
-    with open(filepath) as f:
-        raw_json = f.read()
-        parsed_json = json.loads(raw_json)
-    metadata = parsed_json["metadata"]
-    # Some consumer documents don't have titles.
-    title=""
-    if metadata["title"]:
-        title=metadata["title"]
-
-    document_text = ""
-    for context in parsed_json["contexts"]:
-        document_text += context["text"]
-        document_text += "\n"
-
-    return title + " " + document_text
-
+import logging
+import spacy
 
 def load_queries(path: str):
     """
@@ -87,7 +35,7 @@ def load_queries(path: str):
             if args.use_question_and_query:
                 queries[question_id] = question + "? " + query
             else:
-                queries[question_id] = question + " " + query
+                queries[question_id] = question
 
     return queries
 
@@ -115,16 +63,95 @@ def load_run(path):
 
     return sorted_run
 
-queries = load_queries(path=args.queries)
-run = load_run(path=args.run)
+if __name__=='__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--queries", type=str, required=True,
+                        help="tsv file with two columns, <query_id> and <query_text>")
+    parser.add_argument("--run", type=str, required=True,
+                        help="tsv file with three columns <query_id>, <doc_id> and <rank>")
+    parser.add_argument('--index', required=True, default='',
+                        help='index path')
+    parser.add_argument("--t5_input", type=str, required=True,
+                        help="path to store t5_input, txt format")
+    parser.add_argument("--t5_input_ids", type=str, required=True,
+                        help="path to store the query-doc ids of t5_input, tsv format")
+    parser.add_argument('--use_question_and_query', action='store_true',
+                        help="If true, the t5 input query is a concatenation of \
+                            question and query.  Otherwise, it's just the question.")
+    parser.add_argument('--stride', type=int, default=4, help='')
+    parser.add_argument('--max_length', type=int, default=8, help='')
+    
+    args = parser.parse_args()
 
-print("Writing t5 input and ids")
-with open(args.t5_input, 'w') as fout_t5, open(args.t5_input_ids, 'w') as fout_tsv:
-    for num_examples, (query_id, candidate_doc_ids) in enumerate(
-            tqdm(run.items(), total=len(run))):
-        query = queries[query_id]
-        for candidate_doc_id in candidate_doc_ids:
-            document_text = get_document_text(args.corpus, candidate_doc_id)
-            fout_t5.write(
-                f'Query: {query} Document: {document_text} Relevant:\n')
-            fout_tsv.write(f'{query_id}\t{candidate_doc_id}\n')
+    queries = load_queries(path=args.queries)
+    run = load_run(path=args.run)
+    
+    logging.info(args)
+    nlp = spacy.blank("en")
+    nlp.add_pipe(nlp.create_pipe("sentencizer"))
+    index_utils = IndexReader(args.index)
+
+    # Metrics to report at end
+    num_docs = 0
+    num_segments = 0
+    num_no_segments = 0
+    num_no_content = 0
+
+    print("Writing t5 input and ids")
+    with open(args.t5_input, 'w') as fout_t5_texts, open(args.t5_input_ids, 'w') as fout_t5_ids:
+        for num_examples, (query_id, candidate_doc_ids) in enumerate(
+                tqdm(run.items(), total=len(run))):
+            query = queries[query_id]
+            seen_doc_ids = set()
+            for candidate_doc_id in candidate_doc_ids:
+                if candidate_doc_id in seen_doc_ids:
+                    continue # Should this ever happen?
+                contents = index_utils.doc_contents(candidate_doc_id)
+                if not contents:
+                    print(f'Doc id not found: {candidate_doc_id}')
+                    num_no_content += 1
+                    continue
+                sections = contents.split('\n')
+                if len(sections) == 0:
+                    num_no_content += 1
+                    continue
+                doc_title = sections[0] # TODO Check title is in content.
+                num_docs += 1
+                if len(sections) < 2:
+                    num_no_content += 1
+                    continue
+                
+                # Get passage text excluding title.
+                passage_text = ' '.join(sections[1:])
+                # Remove duplicate spaces and line breaks.
+                passage_text = ' '.join(passage_text.split())
+                
+                # TODO Why do we only consider the first 10K chars?
+                doc = nlp(passage_text[:10000])
+                sentences = [sent.string.strip() for sent in doc.sents]
+
+                if not sentences:
+                    num_no_segments += 1
+                    sentences = ['']
+                
+                for i in range(0, len(sentences), args.stride):
+                    segment = ' '.join(
+                        sentences[i:(i + args.max_length)]).strip()
+
+                    if doc_title:
+                        if doc_title.startswith('.'):
+                            doc_title = doc_title[1:]
+                        segment = '. '.join([doc_title, segment])
+
+                    fout_t5_ids.write(f'{query_id}\t{candidate_doc_id}\t{i}\n')
+                    fout_t5_texts.write(
+                        f'Query: {query} Document: {segment} '
+                        'Relevant:\n')
+                    n_segments += 1
+                    if i + args.max_length >= len(sentences):
+                        break
+                seen_doc_ids.add(candidate_doc_id)
+    print(f'{num_no_content} examples with only title')
+    print(f'Wrote {n_segments} segments from {num_docs} docs.')
+    print(f'There were {num_no_segments} docs without segments/sentences.')
+    print('Done.')
