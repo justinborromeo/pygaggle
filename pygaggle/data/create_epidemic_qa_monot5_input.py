@@ -1,18 +1,20 @@
 """
-This script creates monoT5 input files by taking corpus,
+This script creates monoT5 input files by taking an index,
 queries and the retrieval run file for the queries and then
-create files for monoT5 input. Each line in the monoT5 input
+creating files for monoT5 input. Each line in the monoT5 input
 file follows the format:
     f'Query: {query} Document: {document} Relevant:\n')
 """
 import collections
-from tqdm import tqdm
 import argparse
 import json
-from pathlib import Path
-from os import path
 import logging
 import spacy
+
+from pyserini.index import IndexReader
+from tqdm import tqdm
+from pathlib import Path
+from os import path
 
 def load_queries(path: str):
     """
@@ -32,10 +34,10 @@ def load_queries(path: str):
             question_id = int(question_id_string[2:])
             question = topic["question"]
             query = topic["query"]
-            if args.use_question_and_query:
-                queries[question_id] = question + "? " + query
-            else:
+            if args.use_question:
                 queries[question_id] = question
+            else:
+                queries[question_id] = query
 
     return queries
 
@@ -126,8 +128,9 @@ if __name__=='__main__':
                 # Remove duplicate spaces and line breaks.
                 passage_text = ' '.join(passage_text.split())
                 
-                # TODO Why do we only consider the first 10K chars?
-                doc = nlp(passage_text[:10000])
+                # TODO Why do we only consider the first 10K chars?  May
+                # have to change this: [:10000]
+                doc = nlp(passage_text)
                 sentences = [sent.string.strip() for sent in doc.sents]
 
                 if not sentences:
